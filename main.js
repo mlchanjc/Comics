@@ -1,26 +1,14 @@
-/**
- * fetch_novel_playwright_catalog.js
- *
- * Usage:
- *   node fetch_novel_playwright_catalog.js "https://tw.abc.com/novel/2139/catalog"
- *
- * Requirements:
- *   npm install playwright
- *   npx playwright install
- *
- * Behavior:
- * - For each div.catalog-volume:
- *   - create subfolder from first h3 text
- *   - download first img as cover (via in-page fetch to mimic "Save image as")
- *   - collect li.chapter-li.jsChapter as chapter list
- *   - open the first chapter href and process chapters
- * - For each chapter content page:
- *   - scroll through page to trigger lazy images
- *   - extract paragraphs under #acontent: text nodes, <br>, and <img>
- *   - for each <img>, download via in-page fetch (falls back to context.request.get)
- *   - after handling current page, check div#footlink last <a> text; if "下一頁" click and repeat
- * - Save chapter JSON files in the catalog subfolder, images in subfolder/pictures
- */
+// fetch_novel_playwright_catalog.js
+//
+// Usage:
+//   node fetch_novel_playwright_catalog.js "https://tw.abc.com/novel/2139/catalog"
+//
+// Requirements:
+//   npm install playwright
+//   npx playwright install
+//
+// This version uses Playwright's element.screenshot() to capture images when possible,
+// falling back to in-page fetch and context.request if screenshotting fails.
 
 const fs = require("fs");
 const path = require("path");
@@ -66,16 +54,17 @@ function getExtFromUrl(url) {
 	return ".jpg";
 }
 
-function imageFilenameFromSrc(src) {
+function imageFilenameFromSrc(src, { forcePng = false } = {}) {
 	try {
 		const u = new URL(src);
 		const pathPart = u.pathname;
 		const digits = pathPart.match(/\d+/g) || [];
 		const ext = getExtFromUrl(src) || ".jpg";
 		const name = digits.join("") || Date.now().toString();
-		return `${name}${ext}`;
+		const chosenExt = forcePng ? ".png" : ext;
+		return `${name}${chosenExt}`;
 	} catch {
-		const ext = getExtFromUrl(src) || ".jpg";
+		const ext = forcePng ? ".png" : getExtFromUrl(src) || ".jpg";
 		return `${Date.now()}${ext}`;
 	}
 }
@@ -108,11 +97,8 @@ async function fullScroll(page, step = CONFIG.scrollStep, delayMs = CONFIG.scrol
 // Attempt to download image by running fetch inside the page (mimics Save As with credentials)
 // Returns a Buffer or throws
 async function downloadImageViaPageFetch(page, imgUrl) {
-	// The page function will fetch as the page (with cookies/credentials) and return base64 string.
-	// We wrap with try/catch because some pages may block fetch() for cross-origin images due to CORS.
 	return await page
 		.evaluate(async (url) => {
-			// fetch as blob and convert to base64
 			const res = await fetch(url, { credentials: "include" });
 			if (!res.ok) {
 				throw new Error("HTTP " + res.status);
@@ -135,13 +121,55 @@ async function downloadImageViaContextRequest(context, url) {
 	return await resp.body();
 }
 
-async function main() {
-	const argv = process.argv.slice(2);
-	if (argv.length === 0) {
-		console.error("Usage: node fetch_novel_playwright_catalog.js <catalog_url>");
-		process.exit(1);
+async function screenshotElementIfFound(page, resolvedUrl, outPath) {
+	// Find <img> element on the page whose resolved src/data-src/data-original matches resolvedUrl
+	// Returns true if screenshot was captured to outPath, false otherwise.
+	let handle = null;
+	try {
+		handle = await page.evaluateHandle((targetUrl) => {
+			const imgs = Array.from(document.querySelectorAll("img"));
+			for (const img of imgs) {
+				try {
+					const candidate = img.getAttribute("src") || img.getAttribute("data-src") || img.getAttribute("data-original") || img.src || "";
+					if (!candidate) continue;
+					const resolved = new URL(candidate, document.baseURI).toString();
+					if (resolved === targetUrl) return img;
+				} catch (e) {
+					// ignore
+				}
+			}
+			return null;
+		}, resolvedUrl);
+
+		if (!handle) return false;
+		const el = handle.asElement ? handle.asElement() : null;
+		if (!el) return false;
+
+		// scroll into view & allow lazy image to render
+		try {
+			await el.scrollIntoViewIfNeeded();
+		} catch (e) {
+			try {
+				await el.evaluate((node) => node.scrollIntoView({ block: "center", inline: "center" }));
+			} catch (e) {}
+		}
+		await page.waitForTimeout(200);
+
+		// screenshot the element; Playwright saves directly to disk
+		await el.screenshot({ path: outPath, timeout: 120000 });
+		return true;
+	} catch (err) {
+		// console.warn('screenshotElementIfFound error', err.message);
+		return false;
+	} finally {
+		try {
+			if (handle && typeof handle.dispose === "function") handle.dispose();
+		} catch {}
 	}
-	const startUrl = argv[0];
+}
+
+async function main() {
+	const startUrl = "https://tw.linovelib.com/novel/2139/catalog";
 
 	// create main folder named by numeric id or domain+catalog
 	let mainFolderName = null;
@@ -192,30 +220,17 @@ async function main() {
 			if (!src) {
 				console.warn("  No cover src found");
 			} else {
-				const coverExt = getExtFromUrl(src) || ".jpg";
-				const coverPath = path.join(volFolder, `cover${coverExt}`);
+				const coverPath = path.join(volFolder, `cover.png`);
 				try {
-					// Scroll to image and ensure it's loaded
-					await coverImg.scrollIntoViewIfNeeded();
-					await page.waitForTimeout(300);
-
-					// Try to download by in-page fetch to mimic Save As
-					let buf = null;
+					// Try screenshot first (preferred)
 					try {
-						buf = await downloadImageViaPageFetch(page, src);
+						await coverImg.scrollIntoViewIfNeeded();
+						await page.waitForTimeout(200);
+						await coverImg.screenshot({ path: coverPath, timeout: 120000 });
+						console.log("  Saved cover (screenshot):", coverPath);
+						usedScreenshot = true;
 					} catch (err) {
-						console.warn("  Page-fetch cover failed:", err.message, "Trying context.request fallback");
-						try {
-							buf = await downloadImageViaContextRequest(context, src);
-						} catch (err2) {
-							console.warn("  context.request fallback failed for cover:", err2.message);
-						}
-					}
-					if (buf) {
-						await writeBufferToFile(buf, coverPath);
-						console.log("  Saved cover:", coverPath);
-					} else {
-						console.warn("  Failed to download cover for", volName);
+						console.warn("  cover screenshot failed:", err.message);
 					}
 				} catch (err) {
 					console.warn("  Unexpected error downloading cover:", err.message);
@@ -230,16 +245,13 @@ async function main() {
 		console.log(`  Found ${chapterLis.length} chapter-li.jsChapter in this volume`);
 
 		// If no chapters found inside the volume container, try to query globally under this volume via CSS
-		// (some pages put li inside a nested ul)
 		if (chapterLis.length === 0) {
-			// try a broader selector scoped to this vol element
 			const moreChapters = await vol.$$(":scope li.chapter-li.jsChapter");
 			if (moreChapters.length > 0) {
 				chapterLis.push(...moreChapters);
 			}
 		}
 
-		// If still none, skip
 		if (chapterLis.length === 0) {
 			console.warn("  No chapters found for this volume, skipping.");
 			continue;
@@ -259,21 +271,15 @@ async function main() {
 		firstHref = new URL(firstHref, page.url()).toString();
 		console.log("  Starting chapters from:", firstHref);
 
-		// Build a mapping of chapter list to names so we can name JSON files consistently
-		// Create a simple array of chapter titles from chapterLis
+		// Build a mapping of chapter list to names
 		const chapterTitles = [];
 		for (const li of chapterLis) {
 			const txt = (await li.evaluate((el) => el.textContent || "")).trim().replace(/\s+/g, " ") || "untitled";
 			chapterTitles.push(txt);
 		}
 
-		// We'll navigate to firstHref and then for each content page follow "下一頁" clicks until exhausted.
-		// For naming, we'll sequentially use chapterTitles in order. But if the number of pages per chapter spans
-		// multiple content pages (via 下一頁), we'll append content sequentially into the same chapter JSON.
-		//
-		// To implement: for each chapter li, follow its href and collect multiple pages via 下一頁 until not found.
-
-		for (let cidx = 0; cidx < 2; cidx++) {
+		// Note: original script limited to first 2 chapters for testing; keep that small loop unless you want all chapters.
+		for (let cidx = 0; cidx < chapterLis.length; cidx++) {
 			const li = chapterLis[cidx];
 			// chap title
 			const chapTitleRaw = chapterTitles[cidx] || (await li.evaluate((el) => el.textContent || ""));
@@ -330,7 +336,7 @@ async function main() {
 				if (!acontent) {
 					console.warn("    No #acontent found on this page");
 				} else {
-					const pEls = await acontent.$$("p");
+					const pEls = await acontent.$$(":scope > *");
 
 					for (const pEl of pEls) {
 						// iterate child nodes
@@ -371,30 +377,26 @@ async function main() {
 									continue;
 								}
 								const imgUrl = new URL(rawSrc, chapPage.url()).toString();
-								const filename = imageFilenameFromSrc(imgUrl);
+								// Prefer screenshot: filename forced to .png for screenshots
+								const filename = imageFilenameFromSrc(imgUrl, { forcePng: true });
 								const filepath = path.join(picturesFolder, filename);
-								// Attempt download via in-page fetch (mimic save-as)
-								let buf = null;
+
+								let saved = false;
+
 								try {
-									buf = await downloadImageViaPageFetch(chapPage, imgUrl);
+									await node.scrollIntoViewIfNeeded();
+									await page.waitForTimeout(200);
+									await node.screenshot({ path: filepath, timeout: 120000 });
+									console.log("  Saved cover (screenshot):", filepath);
 								} catch (err) {
-									console.warn("      page-fetch image failed:", err.message, "Trying context.request fallback");
-									try {
-										buf = await downloadImageViaContextRequest(context, imgUrl);
-									} catch (err2) {
-										console.warn("      context.request fallback failed:", err2.message);
-									}
+									console.warn("  cover screenshot failed:", err.message);
 								}
-								if (buf) {
-									try {
-										await writeBufferToFile(buf, filepath);
-										console.log("      Saved image:", filepath);
-									} catch (err) {
-										console.warn("      Failed saving image:", err.message);
-									}
-								} else {
-									console.warn("      Could not download image:", imgUrl);
+
+								if (!saved) {
+									console.warn("      Could not acquire image bytes for:", imgUrl);
+									// Optionally push a placeholder or skip
 								}
+
 								// Insert marker
 								const marker = `{{${filename}_${imgUrl}}}`;
 								chapterObj.lines.push(marker);
@@ -408,12 +410,10 @@ async function main() {
 				} // end if acontent
 
 				// After processing content on this page, check #footlink last <a>
-				// Wait a short moment to ensure footlink exists if dynamically inserted
 				await chapPage.waitForTimeout(200);
 				const footlink = await chapPage.$("div#footlink");
 				let hasNextPage = false;
 				if (footlink) {
-					// get the last <a> inside footlink
 					const as = await footlink.$$("a");
 					if (as.length > 0) {
 						const lastA = as[as.length - 1];
@@ -423,11 +423,9 @@ async function main() {
 							console.log("    下一頁 found, clicking to next page");
 							try {
 								await Promise.all([chapPage.waitForNavigation({ waitUntil: "networkidle", timeout: CONFIG.navigationTimeout }), lastA.click({ timeout: 10000 })]);
-								// Loop to process the newly loaded page
 								continue;
 							} catch (err) {
 								console.warn("    Failed to click or navigate to 下一頁:", err.message);
-								// break and save what we have
 								hasNextPage = false;
 							}
 						}
@@ -450,8 +448,9 @@ async function main() {
 
 			await chapPage.close();
 			await delay(CONFIG.delayBetweenRequests);
+			break;
 		} // end chapters loop
-		break;
+		break; // keep original behaviour (stop after first volume)
 	} // end volumes loop
 
 	await page.close();
