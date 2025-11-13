@@ -98,10 +98,23 @@ async function main() {
 		const liHandles = await ul.$$("li.chapter-li.jsChapter");
 		console.log(`Found ${liHandles.length} chapters in this volume.`);
 
+		let nextChapterUrl = null;
 		for (let i = 0; i < liHandles.length; i++) {
 			const li = liHandles[i];
 			const chapterIndex = i + 1;
 			console.log(`\nProcessing chapter ${chapterIndex} of volume ${v + 1} ...`);
+
+			// Save JSON file named "1.json", "2.json", ... in subfolder
+			const jsonPath = path.join(subDir, `${chapterIndex}.json`);
+			let exists = false;
+			try {
+				await fs.access(jsonPath);
+				console.log(`File exists, chapter ${chapterIndex} of volume ${v + 1}`);
+				continue;
+				//exists = true;
+			} catch (e) {
+				// File does not exist, safe to write
+			}
 
 			// find anchor and href
 			const a = await li.$("a");
@@ -123,10 +136,17 @@ async function main() {
 			}
 
 			const chapterPage = await context.newPage();
+			const origin = "https://tw.linovelib.com";
 			try {
 				await chapterPage.goto(href, { waitUntil: "domcontentloaded" });
 			} catch (e) {
-				console.warn("Navigation error to chapter URL (continuing):", e.message);
+				console.warn("Navigation error 1 to chapter URL (continuing):", href, e.message);
+				try {
+					await chapterPage.goto(origin + nextChapterUrl, { waitUntil: "domcontentloaded" });
+				} catch (e) {
+					console.warn("Navigation error 2 to chapter URL (continuing):", nextChapterUrl, e.message);
+					continue;
+				}
 			}
 
 			try {
@@ -158,48 +178,49 @@ async function main() {
 				} catch (e) {
 					// ignore
 				}
+				if (!exists) {
+					// After the initial wait/race, remove unwanted elements (in case they appeared)
+					try {
+						await chapterPage
+							.evaluate(() => {
+								document.querySelectorAll(".google-auto-placed, iframe, ins").forEach((el) => el.remove());
+							})
+							.catch(() => {});
+					} catch (_) {}
 
-				// After the initial wait/race, remove unwanted elements (in case they appeared)
-				try {
-					await chapterPage
-						.evaluate(() => {
-							document.querySelectorAll(".google-auto-placed, iframe, ins").forEach((el) => el.remove());
-						})
-						.catch(() => {});
-				} catch (_) {}
+					try {
+						await new Promise((res) => setTimeout(res, 1000));
+					} catch (e) {
+						// ignore
+					}
 
-				try {
-					await new Promise((res) => setTimeout(res, 2000));
-				} catch (e) {
-					// ignore
-				}
+					pageCount++;
+					console.log(`  Processing page ${pageCount} of chapter ${chapterIndex} ...`);
 
-				pageCount++;
-				console.log(`  Processing page ${pageCount} of chapter ${chapterIndex} ...`);
+					// Wait for #acontent
+					try {
+						await chapterPage.waitForSelector("#acontent", { timeout: 10000 });
+					} catch (e) {
+						console.warn(" #acontent not found on this page (continuing):", e.message);
+					}
 
-				// Wait for #acontent
-				try {
-					await chapterPage.waitForSelector("#acontent", { timeout: 10000 });
-				} catch (e) {
-					console.warn(" #acontent not found on this page (continuing):", e.message);
-				}
+					// === NEW: remove unwanted elements BEFORE extracting content on each page iteration ===
+					try {
+						await chapterPage
+							.evaluate(() => {
+								document.querySelectorAll(".google-auto-placed, iframe, ins").forEach((el) => el.remove());
+							})
+							.catch(() => {});
+					} catch (_) {}
 
-				// === NEW: remove unwanted elements BEFORE extracting content on each page iteration ===
-				try {
-					await chapterPage
-						.evaluate(() => {
-							document.querySelectorAll(".google-auto-placed, iframe, ins").forEach((el) => el.remove());
-						})
-						.catch(() => {});
-				} catch (_) {}
-
-				// Extract content for current page
-				try {
-					const pageContent = await extractAContent(chapterPage, picturesDir);
-					pagesContents.push(pageContent);
-				} catch (e) {
-					console.warn("Error extracting #acontent:", e.message);
-					pagesContents.push([]);
+					// Extract content for current page
+					try {
+						const pageContent = await extractAContent(chapterPage, picturesDir);
+						pagesContents.push(pageContent);
+					} catch (e) {
+						console.warn("Error extracting #acontent:", e.message);
+						pagesContents.push([]);
+					}
 				}
 
 				// Check the last <a> in #footlink
@@ -250,6 +271,10 @@ async function main() {
 							}
 
 							hasNext = true;
+						} else if (txt.trim() === "下一章") {
+							console.log("  Found 下一章");
+							nextChapterUrl = await chapterPage.evaluate(() => window.ReadParams?.url_next);
+							console.log("ReadParams.url_next =", nextChapterUrl);
 						}
 					}
 				} catch (e) {
@@ -265,8 +290,6 @@ async function main() {
 				contents: pagesContents,
 			};
 
-			// Save JSON file named "1.json", "2.json", ... in subfolder
-			const jsonPath = path.join(subDir, `${chapterIndex}.json`);
 			try {
 				await fs.writeFile(jsonPath, JSON.stringify(jsonObj, null, 2), "utf-8");
 				console.log(`Saved chapter JSON to ${jsonPath}`);
@@ -278,7 +301,6 @@ async function main() {
 				await chapterPage.close();
 			} catch (_) {}
 		} // end li loop
-		break;
 	} // end volume loop
 
 	await browser.close();
@@ -330,15 +352,6 @@ async function extractAContent(page, picturesDir) {
 	const LAZY_TIMEOUT = 20000; // ms
 	const SCROLL_SETTLE = 100; // ms
 	const PRE_CAPTURE_DELAY = 100; // ms
-
-	// helper to get viewport size (fallback sensible default)
-	const getViewport = () => {
-		try {
-			return page.viewportSize ? page.viewportSize() : { width: 1200, height: 900 };
-		} catch (_) {
-			return { width: 1200, height: 900 };
-		}
-	};
 
 	// iterate through each node handle separately
 	for (const handle of properties.values()) {
